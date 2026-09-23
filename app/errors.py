@@ -41,6 +41,8 @@ DEADLINE_EXCEEDED = "deadline_exceeded"      # 最早时刻超过 latest，HTTP 
 BAD_JSON = "bad_json"                        # 请求体不是合法 JSON，HTTP 400
 NOT_FOUND = "not_found"                      # 路径不存在，HTTP 404
 METHOD_NOT_ALLOWED = "method_not_allowed"    # HTTP 方法不允许，HTTP 405
+SERVICE_UNAVAILABLE = "service_unavailable"  # 存储写争用等待超时，HTTP 503
+INTERNAL_ERROR = "internal_error"            # 未预期错误的兜底，HTTP 500
 
 
 def register_exception_handlers(app) -> None:
@@ -67,5 +69,18 @@ def register_exception_handlers(app) -> None:
             return AppError(METHOD_NOT_ALLOWED,
                             "HTTP method not allowed for this path.",
                             status_code=405).to_response()
+        if exc.status_code == 503:
+            return AppError(SERVICE_UNAVAILABLE,
+                            "Service temporarily unavailable.",
+                            status_code=503).to_response()
         return AppError("http_error", str(exc.detail),
                         status_code=exc.status_code).to_response()
+
+    @app.exception_handler(Exception)
+    async def _unhandled_error(_: Request, exc: Exception):
+        # 兜底：任何未预期异常（含 SQLite 内部错误漏网的情形）都不向外
+        # 暴露实现细节，统一成稳定的内部错误结构。
+        return AppError(
+            INTERNAL_ERROR,
+            "An internal error occurred while processing the request.",
+            status_code=500).to_response()

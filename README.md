@@ -17,9 +17,9 @@ app/
   main.py        # FastAPI 入口：/templates、/derivations、/results/{id}
   scheduler.py   # 最早时刻推演（最长路 / Bellman-Ford 式松弛，不枚举候选时间）
   validation.py  # 模板与 delay 覆盖的严格校验 + 规范化
-  db.py          # SQLite 持久层（只写入合法模板与成功结果）
+  db.py          # SQLite 持久层（只写入合法模板与成功结果；BEGIN IMMEDIATE 有界写）
   errors.py      # 稳定错误码与统一错误响应
-tests/           # pytest：分支汇合/乱序/延误传播/零间隔环/正权环 + 接口与持久化
+tests/           # pytest：最长路分支/乱序/环 + 接口持久化 + 真实 SQLite 并发验收
 Dockerfile
 docker-compose.yml
 ```
@@ -98,11 +98,25 @@ python3 -m pytest -q
 | `result_not_found` | 404 | 查询的结果 ID 不存在（含失败推演——它们从不生成记录） |
 | `positive_cycle` | 422 | 规则存在总 min_gap 为正的有向环，不存在有限最早时刻 |
 | `deadline_exceeded` | 422 | 无正权环，但至少一点最早时刻 > latest |
+| `service_unavailable` | 503 | 短暂写争用在有界等待（默认 5 秒，可用 `BROADCAST_DB_BUSY_TIMEOUT` 调整）内未获得写锁；**未产生任何记录**，按相同请求体重试即可 |
 | `not_found` / `method_not_allowed` | 404 / 405 | 未知路径 / 方法不允许 |
 
 判定优先级：**先 positive_cycle，再 deadline_exceeded**。
 `positive_cycle` / `deadline_exceeded` 都是推演失败：不产生结果记录，
 也不改动任何既有数据。
+
+### 并发写与时间戳一致性
+
+- 所有写事务都以 `BEGIN IMMEDIATE` **先取得写锁**再写入：多编辑台并发登记/
+  生成时，短暂的 SQLite 写锁争用会在有界时间内等待，锁提前释放则等待者
+  成功；等待超时返回稳定的 `service_unavailable`（503），**不暴露 SQLite
+  内部错误文本**，且该请求确定没有写入任何行——因此每个 201 响应对应且只
+  对应一条完整记录，重试不会产生无法区分的重复或半成品。
+- `created_at` 由应用在写入前生成一次并**显式存入行内**：POST 响应、
+  列表/详情读取的是同一个字符串，逐字一致（UTC 毫秒、
+  `YYYY-MM-DDTHH:MM:SS.sssZ`，可直接按字典序排序）。模板登记同理。
+- WAL 模式只在数据库尚不是 WAL 时才切换，并容忍多连接同时首启的争用；
+  应用启动期间并发初始化不会再放大成 500。
 
 成功结果中的 `times` 与 `points` 一律按提示点 ID **升序**排列。
 
