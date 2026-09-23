@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
 from fastapi import FastAPI, Request
+from starlette.concurrency import run_in_threadpool
 
 from . import db
 from .errors import (AppError, DEADLINE_EXCEEDED, POSITIVE_CYCLE,
@@ -13,11 +12,6 @@ from .errors import (AppError, DEADLINE_EXCEEDED, POSITIVE_CYCLE,
 from .scheduler import (STATUS_DEADLINE_EXCEEDED, STATUS_OK,
                         STATUS_POSITIVE_CYCLE, earliest_schedule)
 from .validation import validate_delay, validate_template
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z")
 
 
 def create_app(db_path: str | None = None) -> FastAPI:
@@ -41,8 +35,11 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def register_template(request: Request):
         payload = await _load_json_object(request)
         template = validate_template(payload)
-        created_at = _utc_now()
-        template_id = db.insert_template(template, _db_path(request))
+        # created_at 由持久层生成并显式写列；响应只回传同一字符串，
+        # 保证 POST 与后续 GET 逐字一致。所有 SQLite 调用走线程池，避免
+        # busy_timeout 等待阻塞事件循环，并让并发请求真正争用同一写锁。
+        template_id, created_at = await run_in_threadpool(
+            db.insert_template, template, _db_path(request))
         return {
             "template_id": template_id,
             "created_at": created_at,
@@ -63,7 +60,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 "Field 'template_id' is required and must be a non-empty string.",
                 status_code=400, details={"path": "template_id"})
 
-        template = db.get_template(template_id, _db_path(request))
+        template = await run_in_threadpool(
+            db.get_template, template_id, _db_path(request))
         if template is None:
             raise AppError(
                 TEMPLATE_NOT_FOUND,
@@ -91,9 +89,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
         assert outcome["status"] == STATUS_OK
         times = outcome["times"]
-        created_at = _utc_now()
-        result_id = db.insert_result(template_id, delay, times,
-                                     _db_path(request))
+        result_id, created_at = await run_in_threadpool(
+            db.insert_result, template_id, delay, times, _db_path(request))
         return {
             "result_id": result_id,
             "template_id": template_id,
@@ -105,14 +102,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
 
     @app.get("/results/{result_id}")
     async def get_result(result_id: str, request: Request):
-        record = db.get_result(result_id, _db_path(request))
+        record = await run_in_threadpool(
+            db.get_result, result_id, _db_path(request))
         if record is None:
             raise AppError(
                 RESULT_NOT_FOUND,
                 f"Result {result_id!r} does not exist.",
                 status_code=404, details={"result_id": result_id})
 
-        template = db.get_template(record["template_id"], _db_path(request))
+        template = await run_in_threadpool(
+            db.get_template, record["template_id"], _db_path(request))
         # results.template_id 有外键约束，模板必然存在。
         points = template["points"]
         return {

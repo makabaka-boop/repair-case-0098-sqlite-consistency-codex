@@ -10,6 +10,23 @@ SQLite。推演对规则的输入顺序不敏感——同一批规则无论怎�
 - 编排：Docker Compose，HTTP 入口仅绑定本机 `http://127.0.0.1:8000`
 - 交互文档：服务启动后访问 `http://127.0.0.1:8000/docs`
 
+### 并发与持久化语义
+
+多个编辑台同时登记/立即生成时，短暂写争用在有界时间内得到确定结果：
+
+- **WAL 只在启动初始化时切换一次**，由进程内锁 + 文件锁串行化并有界重试；
+  工作连接不再各自切换 journal mode（该 PRAGMA 不接受 busy 等待，是启动期
+  `database is locked` 被放大成 500 的根源）。
+- 写入统一用 `BEGIN IMMEDIATE`：建事务即排队申请写锁，锁释放后等待中的请求
+  直接成功；每个成功响应**恰好对应一条完整记录**，不会因重试产生难区分的
+  重复模板或结果。等待上限可用环境变量 `BROADCAST_DB_BUSY_TIMEOUT`
+  （秒，默认 5）调整。
+- 超过有界等待仍拿不到锁时，返回稳定、可识别、可重试的
+  **503 `service_unavailable`**（带 `Retry-After: 1`），事务回滚、不留
+  半成品，响应中绝不出现 SQLite 内部错误文本。
+- `created_at` 由应用生成一次后**显式写入并原样返回**：同一记录在创建响应、
+  列表/详情读取中逐字一致（UTC、毫秒精度、`...Z`），按时间排序与审计稳定。
+
 ## 目录结构
 
 ```
@@ -17,9 +34,9 @@ app/
   main.py        # FastAPI 入口：/templates、/derivations、/results/{id}
   scheduler.py   # 最早时刻推演（最长路 / Bellman-Ford 式松弛，不枚举候选时间）
   validation.py  # 模板与 delay 覆盖的严格校验 + 规范化
-  db.py          # SQLite 持久层（只写入合法模板与成功结果）
-  errors.py      # 稳定错误码与统一错误响应
-tests/           # pytest：分支汇合/乱序/延误传播/零间隔环/正权环 + 接口与持久化
+  db.py          # SQLite 持久层（只写入合法模板与成功结果；WAL 单次初始化、BEGIN IMMEDIATE 有界等待）
+  errors.py      # 稳定错误码与统一错误响应（含 503 service_unavailable）
+tests/           # pytest：分支汇合/乱序/延误传播/零间隔环/正权环 + 接口与持久化 + 真实 SQLite 并发验收
 Dockerfile
 docker-compose.yml
 ```
@@ -98,6 +115,7 @@ python3 -m pytest -q
 | `result_not_found` | 404 | 查询的结果 ID 不存在（含失败推演——它们从不生成记录） |
 | `positive_cycle` | 422 | 规则存在总 min_gap 为正的有向环，不存在有限最早时刻 |
 | `deadline_exceeded` | 422 | 无正权环，但至少一点最早时刻 > latest |
+| `service_unavailable` | 503 | 并发写争用在有界等待（默认 5s）后仍未获得写锁；可重试，带 `Retry-After: 1`，不暴露 SQLite 内部错误 |
 | `not_found` / `method_not_allowed` | 404 / 405 | 未知路径 / 方法不允许 |
 
 判定优先级：**先 positive_cycle，再 deadline_exceeded**。
